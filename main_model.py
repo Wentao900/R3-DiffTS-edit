@@ -114,6 +114,8 @@ class CSDI_base(nn.Module):
         self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
         self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
         self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        self.boundary_loss_weight = float(train_cfg.get("boundary_loss_weight", 0.0))
+        self.trend_loss_weight = float(train_cfg.get("trend_loss_weight", 0.0))
         self.use_scale_router = bool(train_cfg.get("use_scale_router", False))
         self.scale_router_entropy_weight = float(train_cfg.get("scale_router_entropy_weight", 1.0e-3))
         self.scale_router_teacher_weight = float(train_cfg.get("scale_router_teacher_weight", 0.1))
@@ -353,6 +355,43 @@ class CSDI_base(nn.Module):
 
         return (weights * band_losses).sum(dim=-1).mean() + regularizer
 
+    def compute_boundary_consistency_loss(self, predicted, observed_data, target_mask):
+        future_mask = target_mask[:, :, self.lookback_len:]
+        if future_mask.shape[-1] == 0:
+            return torch.tensor(0.0, device=predicted.device)
+        boundary_mask = future_mask[:, :, 0]
+        prev_value = observed_data[:, :, self.lookback_len - 1]
+        next_value = predicted[:, :, self.lookback_len]
+        boundary_error = F.huber_loss(next_value, prev_value, delta=1.0, reduction="none")
+        denom = boundary_mask.sum().clamp_min(1.0)
+        return (boundary_error * boundary_mask).sum() / denom
+
+    def compute_trend_consistency_loss(self, predicted, target_mask, trend_prior=None, text_mask=None):
+        future_mask = target_mask[:, :, self.lookback_len:]
+        future_pred = predicted[:, :, self.lookback_len:]
+        if future_mask.shape[-1] < 2 or trend_prior is None:
+            return torch.tensor(0.0, device=predicted.device)
+
+        valid_series = (future_mask.sum(dim=-1) > 0).float()
+        horizon = max(future_pred.shape[-1] - 1, 1)
+        slope = (future_pred[:, :, -1] - future_pred[:, :, 0]) / horizon
+
+        direction = trend_prior[:, 0].view(-1, 1)
+        strength = trend_prior[:, 1].view(-1, 1).clamp_min(0.5)
+
+        directional_error = F.relu(-(direction * slope))
+        flat_error = slope.abs()
+        direction_mask = (direction.abs() > 0.5).float()
+        trend_error = direction_mask * directional_error + (1.0 - direction_mask) * flat_error
+        trend_error = trend_error * strength * valid_series
+
+        if text_mask is not None:
+            trend_error = trend_error * text_mask.float().view(-1, 1)
+            denom = (valid_series * text_mask.float().view(-1, 1)).sum().clamp_min(1.0)
+        else:
+            denom = valid_series.sum().clamp_min(1.0)
+        return trend_error.sum() / denom
+
     def calc_loss_valid(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, text_mask=None, trend_prior=None
     ):
@@ -423,6 +462,21 @@ class CSDI_base(nn.Module):
             loss = loss + self.multi_res_loss_weight * aux_loss
             if is_train == 1:
                 self.router_step += 1
+        if (not self.noise_esti) and self.boundary_loss_weight > 0:
+            boundary_loss = self.compute_boundary_consistency_loss(
+                predicted=predicted,
+                observed_data=observed_data,
+                target_mask=target_mask,
+            )
+            loss = loss + self.boundary_loss_weight * boundary_loss
+        if (not self.noise_esti) and self.trend_loss_weight > 0:
+            trend_loss = self.compute_trend_consistency_loss(
+                predicted=predicted,
+                target_mask=target_mask,
+                trend_prior=trend_prior,
+                text_mask=text_mask,
+            )
+            loss = loss + self.trend_loss_weight * trend_loss
         return loss
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):

@@ -49,6 +49,8 @@ parser.add_argument('--trend_time_floor', type=float, default=0.30, help='minimu
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace parsed trend prior with random trend vectors')
 parser.add_argument('--multi_res_band_boundaries', nargs='*', type=int, default=None, help='prediction band boundaries for multi-resolution loss')
 parser.add_argument('--multi_res_loss_weight', type=float, default=-1, help='weight for multi-resolution auxiliary loss')
+parser.add_argument('--boundary_loss_weight', type=float, default=-1, help='weight for history-forecast boundary consistency loss')
+parser.add_argument('--trend_loss_weight', type=float, default=-1, help='weight for trend consistency loss against trend prior')
 parser.add_argument('--use_scale_router', action='store_true', help='enable scale router for band weighting')
 parser.add_argument('--scale_router_hidden_dim', type=int, default=-1, help='hidden size of scale router')
 parser.add_argument('--scale_router_entropy_weight', type=float, default=-1, help='entropy regularizer for scale router')
@@ -138,6 +140,8 @@ config["train"].setdefault("multi_res_band_boundaries", [])
 config["train"].setdefault("multi_res_loss_weight", 0.0)
 config["train"].setdefault("multi_res_use_huber", True)
 config["train"].setdefault("multi_res_huber_delta", 1.0)
+config["train"].setdefault("boundary_loss_weight", 0.0)
+config["train"].setdefault("trend_loss_weight", 0.0)
 config["train"].setdefault("use_scale_router", False)
 config["train"].setdefault("scale_router_hidden_dim", 32)
 config["train"].setdefault("scale_router_dropout", 0.1)
@@ -150,6 +154,10 @@ if args.multi_res_band_boundaries is not None:
     config["train"]["multi_res_band_boundaries"] = args.multi_res_band_boundaries
 if args.multi_res_loss_weight >= 0:
     config["train"]["multi_res_loss_weight"] = args.multi_res_loss_weight
+if args.boundary_loss_weight >= 0:
+    config["train"]["boundary_loss_weight"] = args.boundary_loss_weight
+if args.trend_loss_weight >= 0:
+    config["train"]["trend_loss_weight"] = args.trend_loss_weight
 if args.use_scale_router:
     config["train"]["use_scale_router"] = True
 if args.scale_router_hidden_dim > 0:
