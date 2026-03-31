@@ -99,6 +99,13 @@ context_dim_dict = {
 path = "config/" + args.config
 with open(path, "r") as f:
     config = yaml.safe_load(f)
+eval_cfg = config.setdefault("eval", {})
+guide_w_values = eval_cfg.get(
+    "guide_w_values",
+    [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 5.0],
+)
+if args.guide_w < 0:
+    args.guide_w = eval_cfg.get("guide_w", args.guide_w)
 if args.embed == 'timeF':
     if config["model"]["timestep_branch"] or config["model"]["timestep_emb_cat"]:
         config["model"]["timestep_dim"] = timestep_dim_dict[args.freq]
@@ -137,6 +144,8 @@ config["train"].setdefault("scale_router_dropout", 0.1)
 config["train"].setdefault("scale_router_entropy_weight", 1.0e-3)
 config["train"].setdefault("scale_router_teacher_weight", 0.1)
 config["train"].setdefault("scale_router_warmup_steps", 400)
+config["eval"]["guide_w"] = args.guide_w
+config["eval"]["guide_w_values"] = guide_w_values
 if args.multi_res_band_boundaries is not None:
     config["train"]["multi_res_band_boundaries"] = args.multi_res_band_boundaries
 if args.multi_res_loss_weight >= 0:
@@ -227,7 +236,7 @@ if config["diffusion"]["cfg"]:
         )
     else:
         best_mse = 10e10
-        for guide_w in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 3.0, 4.0, 5.0]:
+        for guide_w in guide_w_values:
             mse = evaluate(
                 model,
                 test_loader,
