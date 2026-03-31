@@ -47,8 +47,6 @@ parser.add_argument('--trend_strength_scale', type=float, default=0.35, help='tr
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='trend volatility suppression scale')
 parser.add_argument('--trend_time_floor', type=float, default=0.30, help='minimum time schedule floor for trend-aware CFG')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace parsed trend prior with random trend vectors')
-parser.add_argument('--use_min_snr', action='store_true', help='enable Min-SNR weighting for diffusion training')
-parser.add_argument('--min_snr_gamma', type=float, default=5.0, help='gamma for Min-SNR timestep weighting')
 parser.add_argument('--multi_res_band_boundaries', nargs='*', type=int, default=None, help='prediction band boundaries for multi-resolution loss')
 parser.add_argument('--multi_res_loss_weight', type=float, default=-1, help='weight for multi-resolution auxiliary loss')
 parser.add_argument('--use_scale_router', action='store_true', help='enable scale router for band weighting')
@@ -136,8 +134,6 @@ config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
-config["diffusion"]["use_min_snr"] = args.use_min_snr
-config["diffusion"]["min_snr_gamma"] = args.min_snr_gamma
 config["train"].setdefault("multi_res_band_boundaries", [])
 config["train"].setdefault("multi_res_loss_weight", 0.0)
 config["train"].setdefault("multi_res_use_huber", True)
