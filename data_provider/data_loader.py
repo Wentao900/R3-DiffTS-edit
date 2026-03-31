@@ -6,6 +6,8 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from utils.timefeatures import time_features
 import warnings
 from utils.prepare4llm import get_desc
+from utils.rag_cot import RAGCoTConfig, RAGCoTPipeline
+from utils.trend_prior import build_trend_fields, trend_fields_to_vector
 
 warnings.filterwarnings('ignore')
 
@@ -13,7 +15,14 @@ class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
                  target='OT', scale=True, timeenc=0, freq='h',
-                 text_len=1, scaler_type='standard'):
+                 text_len=1, scaler_type='standard',
+                 use_rag_cot=False, rag_topk=3, cot_model=None,
+                 cot_max_new_tokens=96, cot_temperature=0.7,
+                 cot_cache_size=512, cot_device=None,
+                 rag_only=False,
+                 rag_use_retrieval=True, use_two_stage_rag=False,
+                 rag_stage1_topk=6, rag_stage2_topk=3,
+                 two_stage_gate=True, trend_slope_eps=1.0e-3):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -33,6 +42,8 @@ class Dataset_Custom(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.text_len = text_len
+        self.use_rag_cot = use_rag_cot
+        self.trend_slope_eps = trend_slope_eps
 
         self.root_path = root_path
         self.data_path = data_path
@@ -52,6 +63,28 @@ class Dataset_Custom(Dataset):
         self.__read_data__()
         self.domain = data_path.split('/')[0]
         self.desc = get_desc(self.domain, self.seq_len, self.pred_len)
+        self.rag_pipeline = RAGCoTPipeline(
+            domain_desc=self.desc,
+            search_df=self.txt_search,
+            lookback_len=self.seq_len,
+            pred_len=self.pred_len,
+            config=RAGCoTConfig(
+                use_rag_cot=use_rag_cot,
+                use_retrieval=rag_use_retrieval,
+                rag_topk=rag_topk,
+                use_two_stage_rag=use_two_stage_rag,
+                rag_stage1_topk=rag_stage1_topk,
+                rag_stage2_topk=rag_stage2_topk,
+                two_stage_gate=two_stage_gate,
+                trend_slope_eps=trend_slope_eps,
+                cot_model=cot_model,
+                cot_max_new_tokens=cot_max_new_tokens,
+                cot_temperature=cot_temperature,
+                cot_cache_size=cot_cache_size,
+                cot_device=cot_device,
+                generate_cot=not rag_only,
+            ),
+        ) if use_rag_cot else None
         self.tot_len = len(self.data_x) - self.seq_len - self.pred_len + 1
         
 
@@ -66,9 +99,11 @@ class Dataset_Custom(Dataset):
 
         df_num['date'], df_num['start_date'], df_num['end_date'] = pd.to_datetime(df_num['date']), pd.to_datetime(df_num['start_date']), pd.to_datetime(df_num['end_date'])
         df_report['start_date'], df_report['end_date'] = pd.to_datetime(df_report['start_date']), pd.to_datetime(df_report['end_date'])
+        df_search['start_date'], df_search['end_date'] = pd.to_datetime(df_search['start_date']), pd.to_datetime(df_search['end_date'])
 
         df_num = df_num.sort_values('date', ascending=True).reset_index(drop=True)
         df_report = df_report.sort_values('start_date', ascending=True).reset_index(drop=True)
+        df_search = df_search.sort_values('start_date', ascending=True).reset_index(drop=True)
         num_train = int(len(df_num) * 0.7)
         num_test = int(len(df_num) * 0.2)
         num_vali = len(df_num) - num_train - num_test
@@ -82,6 +117,7 @@ class Dataset_Custom(Dataset):
         final_end_date = df_num.end_date[border2-1]
 
         df_data = df_num[[self.target]]
+        self.raw_values = df_data.values.astype(np.float32)
 
         if self.scale:
             train_data = df_data[border1s[0]:border2s[0]]
@@ -110,6 +146,8 @@ class Dataset_Custom(Dataset):
         self.data_stamp = data_stamp
         self.num_dates = df_num[['start_date', 'end_date']][border1:border2].reset_index(drop=True)
         self.txt_report = df_report[['start_date', 'end_date', 'fact']].loc[(df_report.end_date >= first_start_date) & (df_report.end_date <= final_end_date)]
+        self.txt_search = df_search[['start_date', 'end_date', 'fact']].loc[(df_search.end_date >= first_start_date) & (df_search.end_date <= final_end_date)].reset_index(drop=True)
+        self.raw_x = self.raw_values[border1:border2]
 
     def collect_text(self, start_date, end_date):
         report = self.txt_report.loc[(self.txt_report.end_date >= start_date) & (self.txt_report.end_date <= end_date)]
@@ -124,6 +162,26 @@ class Dataset_Custom(Dataset):
             text_mark = 0
         all_txt = ' '.join(report)
         return all_txt, text_mark
+
+    def build_text_features(self, raw_text, numeric_history, end_date):
+        base_text = raw_text
+        if raw_text not in {"", "NA"} and raw_text.startswith(self.desc):
+            base_text = raw_text[len(self.desc):].strip()
+        if self.rag_pipeline is None:
+            cot_text = ""
+            enriched_text = raw_text
+        else:
+            allowed_indices = np.where(self.txt_search["end_date"].values <= np.datetime64(end_date))[0]
+            rag_outputs = self.rag_pipeline.build(
+                raw_text=base_text,
+                numeric_history=numeric_history,
+                allowed_indices=allowed_indices,
+            )
+            cot_text = rag_outputs["cot_text"]
+            enriched_text = rag_outputs["text"]
+        trend_fields = build_trend_fields(cot_text, numeric_history, slope_eps=self.trend_slope_eps)
+        trend_prior = trend_fields_to_vector(trend_fields)
+        return enriched_text, cot_text, trend_prior
     
     def __getitem__(self, index):
         s_begin = index
@@ -137,11 +195,17 @@ class Dataset_Custom(Dataset):
     
         seq_x_stamp = self.data_stamp[s_begin:s_end]
         seq_y_stamp = self.data_stamp[r_begin:r_end]
+        seq_x_raw = self.raw_x[s_begin:s_end, :]
 
         text_begin = s_end - self.text_len
         text_end = s_end
 
         seq_x_txt, txt_mark = self.collect_text(self.num_dates.start_date[text_begin], self.num_dates.end_date[text_end])
+        seq_x_txt, cot_text, trend_prior = self.build_text_features(
+            raw_text=seq_x_txt,
+            numeric_history=seq_x_raw[:, 0],
+            end_date=self.num_dates.end_date[text_end],
+        )
 
         observed_data = np.concatenate([seq_x, seq_y], axis=0)
         timesteps = np.concatenate([seq_x_stamp, seq_y_stamp], axis=0)
@@ -156,7 +220,9 @@ class Dataset_Custom(Dataset):
             'feature_id': np.arange(seq_x.shape[1]).astype(np.float32),
             'timesteps': timesteps,
             'texts': seq_x_txt,
-            'text_mark': txt_mark
+            'text_mark': np.asarray(txt_mark, dtype=np.int64),
+            'cot_text': cot_text,
+            'trend_prior': trend_prior,
         }
 
         return s

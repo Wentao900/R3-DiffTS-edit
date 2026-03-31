@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diff_models import diff_CSDI
 from utils.prepare4llm import get_llm
 
@@ -54,7 +55,20 @@ class CSDI_series_decomp(nn.Module):
         moving_mean = nn.functional.pad(moving_mean, (0, self.pred_len), "constant", 0)
         res = nn.functional.pad(res, (0, self.pred_len), "constant", 0)
         return res, moving_mean
-        
+
+
+class ScaleRouter(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
     
 
@@ -88,6 +102,23 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.trend_cfg = config["diffusion"].get("trend_cfg", False)
+        self.trend_cfg_power = config["diffusion"].get("trend_cfg_power", 1.0)
+        self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 0.35)
+        self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
+        self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.30)
+        self.trend_cfg_random = config["diffusion"].get("trend_cfg_random", False)
+
+        train_cfg = config.get("train", {})
+        self.multi_res_band_boundaries = [int(x) for x in train_cfg.get("multi_res_band_boundaries", [])]
+        self.multi_res_loss_weight = float(train_cfg.get("multi_res_loss_weight", 0.0))
+        self.multi_res_use_huber = bool(train_cfg.get("multi_res_use_huber", True))
+        self.multi_res_huber_delta = float(train_cfg.get("multi_res_huber_delta", 1.0))
+        self.use_scale_router = bool(train_cfg.get("use_scale_router", False))
+        self.scale_router_entropy_weight = float(train_cfg.get("scale_router_entropy_weight", 1.0e-3))
+        self.scale_router_teacher_weight = float(train_cfg.get("scale_router_teacher_weight", 0.1))
+        self.scale_router_warmup_steps = int(train_cfg.get("scale_router_warmup_steps", 400))
+        self.router_step = 0
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -160,6 +191,12 @@ class CSDI_base(nn.Module):
         self.alpha_hat = 1 - self.beta
         self.alpha = np.cumprod(self.alpha_hat)
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
+        self.band_slices = self._build_band_slices(self.multi_res_band_boundaries, self.pred_len)
+        self.scale_router = None
+        if self.use_scale_router and len(self.band_slices) > 0:
+            hidden_dim = int(train_cfg.get("scale_router_hidden_dim", 32))
+            dropout = float(train_cfg.get("scale_router_dropout", 0.1))
+            self.scale_router = ScaleRouter(input_dim=8, hidden_dim=hidden_dim, output_dim=len(self.band_slices), dropout=dropout)
 
     def time_embedding(self, pos, d_model=128):
         pe = torch.zeros(pos.shape[0], pos.shape[1], d_model).to(self.device)
@@ -220,19 +257,115 @@ class CSDI_base(nn.Module):
 
         return side_info
 
+    def _build_band_slices(self, boundaries, pred_len):
+        if not boundaries:
+            return []
+        valid_boundaries = sorted({min(max(int(boundary), 1), pred_len) for boundary in boundaries})
+        if valid_boundaries[-1] != pred_len:
+            valid_boundaries.append(pred_len)
+        slices = []
+        start = 0
+        for end in valid_boundaries:
+            if end > start:
+                slices.append((start, end))
+                start = end
+        return slices
+
+    def prepare_trend_prior(self, trend_prior):
+        if trend_prior is None:
+            return None
+        if self.trend_cfg_random:
+            direction = torch.randint(-1, 2, (trend_prior.shape[0], 1), device=trend_prior.device).float()
+            strength = torch.empty((trend_prior.shape[0], 1), device=trend_prior.device).uniform_(0.5, 1.5)
+            volatility = torch.empty((trend_prior.shape[0], 1), device=trend_prior.device).uniform_(0.0, 1.0)
+            return torch.cat([direction, strength, volatility], dim=1)
+        return trend_prior
+
+    def get_effective_guide_weight(self, base_guide_w, trend_prior, step_idx, batch_size):
+        guide = torch.full((batch_size,), float(base_guide_w), device=self.device)
+        if (not self.trend_cfg) or trend_prior is None:
+            return guide
+        trend_prior = self.prepare_trend_prior(trend_prior)
+        total_steps = max(self.sample_steps - 1, 1)
+        progress = 1.0 - (float(step_idx) / total_steps)
+        time_scale = self.trend_time_floor + (1.0 - self.trend_time_floor) * (progress ** self.trend_cfg_power)
+        strength_scale = 1.0 + self.trend_strength_scale * (trend_prior[:, 1] - 1.0)
+        volatility_scale = 1.0 / (1.0 + self.trend_volatility_scale * trend_prior[:, 2])
+        return guide * time_scale * strength_scale * volatility_scale
+
+    def build_router_features(self, history, text_mask=None, trend_prior=None):
+        slope = history[:, :, -1] - history[:, :, 0]
+        volatility = history.std(dim=-1)
+        if history.shape[-1] >= 4:
+            mid = history.shape[-1] // 2
+            left_slope = history[:, :, mid - 1] - history[:, :, 0]
+            right_slope = history[:, :, -1] - history[:, :, mid]
+            acceleration = right_slope - left_slope
+        else:
+            acceleration = torch.zeros_like(slope)
+
+        stats = torch.stack(
+            [
+                slope.mean(dim=1),
+                slope.abs().mean(dim=1),
+                volatility.mean(dim=1),
+                acceleration.mean(dim=1),
+            ],
+            dim=1,
+        )
+        if trend_prior is None:
+            trend_prior = torch.zeros((history.shape[0], 3), device=history.device)
+        if text_mask is None:
+            text_mask = torch.zeros((history.shape[0],), device=history.device)
+        return torch.cat([stats, trend_prior.float(), text_mask.float().unsqueeze(1)], dim=1)
+
+    def compute_multi_res_loss(self, predicted, target, target_mask, history, text_mask=None, trend_prior=None, is_train=1):
+        future_pred = predicted[:, :, self.lookback_len:]
+        future_target = target[:, :, self.lookback_len:]
+        future_mask = target_mask[:, :, self.lookback_len:]
+
+        band_losses = []
+        for start, end in self.band_slices:
+            band_pred = future_pred[:, :, start:end]
+            band_target = future_target[:, :, start:end]
+            band_mask = future_mask[:, :, start:end]
+            if self.multi_res_use_huber:
+                band_error = F.huber_loss(band_pred, band_target, delta=self.multi_res_huber_delta, reduction="none")
+            else:
+                band_error = (band_pred - band_target) ** 2
+            denom = band_mask.sum(dim=(1, 2)).clamp_min(1.0)
+            band_loss = (band_error * band_mask).sum(dim=(1, 2)) / denom
+            band_losses.append(band_loss)
+
+        band_losses = torch.stack(band_losses, dim=1)
+        weights = torch.full_like(band_losses, 1.0 / band_losses.shape[1])
+        regularizer = torch.tensor(0.0, device=predicted.device)
+
+        if self.scale_router is not None:
+            features = self.build_router_features(history, text_mask=text_mask, trend_prior=trend_prior)
+            logits = self.scale_router(features)
+            weights = torch.softmax(logits, dim=-1)
+            if is_train == 1 and self.router_step < self.scale_router_warmup_steps and self.scale_router_teacher_weight > 0:
+                teacher = torch.softmax(band_losses.detach(), dim=-1)
+                weights = (1.0 - self.scale_router_teacher_weight) * weights + self.scale_router_teacher_weight * teacher
+            entropy = -(weights * torch.log(weights.clamp_min(1.0e-8))).sum(dim=-1).mean()
+            regularizer = -self.scale_router_entropy_weight * entropy
+
+        return (weights * band_losses).sum(dim=-1).mean() + regularizer
+
     def calc_loss_valid(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, text_mask=None, trend_prior=None
     ):
         loss_sum = 0
         for t in range(self.num_steps): 
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context
+                observed_data, cond_mask, observed_mask, side_info, is_train, set_t=t, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, text_mask=text_mask, trend_prior=trend_prior
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, set_t=-1
+        self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, text_mask=None, trend_prior=None, set_t=-1
     ):  
         
         B, K, L = observed_data.shape
@@ -277,6 +410,19 @@ class CSDI_base(nn.Module):
             residual = (observed_data - predicted) * target_mask 
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.band_slices) > 0:
+            aux_loss = self.compute_multi_res_loss(
+                predicted=predicted,
+                target=observed_data,
+                target_mask=target_mask,
+                history=observed_data[:, :, :self.lookback_len],
+                text_mask=text_mask,
+                trend_prior=trend_prior,
+                is_train=is_train,
+            )
+            loss = loss + self.multi_res_loss_weight * aux_loss
+            if is_train == 1:
+                self.router_step += 1
         return loss
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
@@ -297,7 +443,7 @@ class CSDI_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None):
+    def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None):
         B, K, L = observed_data.shape
         if self.ddim:
             if self.sample_method == 'linear':
@@ -368,7 +514,8 @@ class CSDI_base(nn.Module):
                             predicted = self.diffmodel(diff_input, side_info, torch.tensor([t]).to(self.device), cfg_mask, timestep_emb, size_emb, context) # (2*B, K, L)
                 if self.cfg:
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
-                    predicted = predicted_uncond + guide_w * (predicted_cond - predicted_uncond)
+                    effective_guide = self.get_effective_guide_weight(guide_w, trend_prior, t, B)
+                    predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
 
                 if self.noise_esti:
                     # noise prediction
@@ -482,6 +629,7 @@ class CSDI_Forecasting(CSDI_base):
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
         text_mask = batch["text_mark"].to(self.device).int()
+        trend_prior = batch["trend_prior"].to(self.device).float() if "trend_prior" in batch else None
         if self.timestep_emb_cat or self.timestep_branch:
             timesteps = batch["timesteps"].to(self.device).float()
             timesteps = timesteps.permute(0, 2, 1)
@@ -509,6 +657,7 @@ class CSDI_Forecasting(CSDI_base):
             timesteps, 
             texts,
             text_mask, 
+            trend_prior,
         )        
 
     def sample_features(self,observed_data, observed_mask,feature_id,gt_mask):
@@ -598,6 +747,7 @@ class CSDI_Forecasting(CSDI_base):
             timesteps, 
             texts,
             text_mask, 
+            trend_prior,
         ) = self.process_data(batch)
         if is_train == 1 and (self.target_dim_base > self.num_sample_features):
             observed_data, observed_mask,feature_id,gt_mask = \
@@ -635,7 +785,19 @@ class CSDI_Forecasting(CSDI_base):
 
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
 
-        return loss_func(observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+        return loss_func(
+            observed_data,
+            cond_mask,
+            observed_mask,
+            side_info,
+            is_train,
+            timesteps=timesteps,
+            timestep_emb=timestep_emb,
+            size_emb=size_emb,
+            context=context,
+            text_mask=text_mask,
+            trend_prior=trend_prior,
+        )
 
     def evaluate(self, batch, n_samples, guide_w):
         (
@@ -649,6 +811,7 @@ class CSDI_Forecasting(CSDI_base):
             timesteps,
             texts,
             text_mask,
+            trend_prior,
         ) = self.process_data(batch)
 
         with torch.no_grad():
@@ -675,9 +838,9 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 context = None
             if self.save_attn:
-                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+                samples, attn = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
             else:
-                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context)
+                samples = self.impute(observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=timesteps, timestep_emb=timestep_emb, size_emb=size_emb, context=context, trend_prior=trend_prior)
 
         if self.save_attn:
             if self.save_token:

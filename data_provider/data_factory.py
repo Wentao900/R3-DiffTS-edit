@@ -19,6 +19,24 @@ def data_provider(args, flag):
     drop_last = False if flag == 'test' else True
     batch_size = args.batch_size
     freq = args.freq
+    extra_kwargs = {}
+    if args.data == "custom":
+        extra_kwargs = {
+            "use_rag_cot": getattr(args, "use_rag_cot", False),
+            "rag_topk": getattr(args, "rag_topk", 3),
+            "cot_model": getattr(args, "cot_model", None),
+            "cot_max_new_tokens": getattr(args, "cot_max_new_tokens", 96),
+            "cot_temperature": getattr(args, "cot_temperature", 0.7),
+            "cot_cache_size": getattr(args, "cot_cache_size", 512),
+            "cot_device": getattr(args, "cot_device", None),
+            "rag_only": getattr(args, "rag_only", False),
+            "rag_use_retrieval": not getattr(args, "cot_only", False),
+            "use_two_stage_rag": getattr(args, "use_two_stage_rag", False),
+            "rag_stage1_topk": getattr(args, "rag_stage1_topk", 6),
+            "rag_stage2_topk": getattr(args, "rag_stage2_topk", 3),
+            "two_stage_gate": getattr(args, "two_stage_gate", True),
+            "trend_slope_eps": getattr(args, "trend_slope_eps", 1.0e-3),
+        }
     data_set = Data(
         root_path=args.root_path,
         data_path=args.data_path,
@@ -28,7 +46,8 @@ def data_provider(args, flag):
         target=args.target,
         timeenc=timeenc,
         freq=freq,
-        text_len=args.text_len
+        text_len=args.text_len,
+        **extra_kwargs,
     )
     print(flag, len(data_set))
     data_loader = DataLoader(
@@ -38,4 +57,3 @@ def data_provider(args, flag):
         num_workers=args.num_workers,
         drop_last=drop_last)
     return data_set, data_loader
-
