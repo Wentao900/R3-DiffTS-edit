@@ -235,9 +235,9 @@ if config["diffusion"]["cfg"]:
             save_token=args.save_token
         )
     else:
-        best_mse = 10e10
+        sweep_results = []
         for guide_w in guide_w_values:
-            mse = evaluate(
+            metrics = evaluate(
                 model,
                 test_loader,
                 nsample=args.nsample,
@@ -249,7 +249,20 @@ if config["diffusion"]["cfg"]:
                 save_attn=args.save_attn,
                 save_token=args.save_token
             )
-            best_mse = min(best_mse, mse)
+            sweep_results.append(metrics)
+
+        best_mse_result = min(sweep_results, key=lambda item: item["MSE"])
+        best_mae_result = min(sweep_results, key=lambda item: item["MAE"])
+        sweep_summary = {
+            "guide_w_values": guide_w_values,
+            "num_trials": len(sweep_results),
+            "best_by_mse": best_mse_result,
+            "best_by_mae": best_mae_result,
+        }
+        with open(os.path.join(foldername, "guide_w_sweep_summary.json"), "w") as f:
+            json.dump(sweep_summary, f, indent=4)
+        print("Best guide_w by MSE:", best_mse_result["guide_w"], "MSE:", best_mse_result["MSE"], "MAE:", best_mse_result["MAE"])
+        print("Best guide_w by MAE:", best_mae_result["guide_w"], "MSE:", best_mae_result["MSE"], "MAE:", best_mae_result["MAE"])
 else:
     evaluate(
             model,

@@ -4,6 +4,7 @@ from torch.optim import Adam, AdamW
 from tqdm import tqdm
 import os
 import json
+import datetime
 
 
 def train(
@@ -118,6 +119,11 @@ def calc_quantile_CRPS_sum(target, forecast, eval_points, mean_scaler, scaler):
         CRPS += q_loss / denom
     return CRPS.item() / len(quantiles)
 
+
+def append_jsonl(filepath, payload):
+    with open(filepath, "a") as f:
+        f.write(json.dumps(payload) + "\n")
+
 def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldername="", window_lens=[1, 1], guide_w=0, save_attn=False, save_token=False):
     model.load_state_dict(torch.load(foldername + "/model.pth"))
     with torch.no_grad():
@@ -218,12 +224,15 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
             #     np.save(foldername + "/tokens" + ".npy", np.asarray(all_tokens))
 
             results = {
+                "timestamp": datetime.datetime.now().isoformat(),
                 "guide_w": guide_w,
                 "MSE": nmse_total / evalpoints_total,
                 "MAE": nmae_total / evalpoints_total,
             }
+            if foldername != "":
+                append_jsonl(os.path.join(foldername, "guide_w_eval_log.jsonl"), results)
             with open(foldername + "config_results.json", "a") as f:
                 json.dump(results, f, indent=4)
             print("MSE:", nmse_total / evalpoints_total)
             print("MAE:", nmae_total / evalpoints_total)
-    return nmse_total / evalpoints_total
+    return results
