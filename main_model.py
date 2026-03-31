@@ -108,6 +108,8 @@ class CSDI_base(nn.Module):
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.30)
         self.trend_cfg_random = config["diffusion"].get("trend_cfg_random", False)
+        self.use_min_snr = config["diffusion"].get("use_min_snr", False)
+        self.min_snr_gamma = float(config["diffusion"].get("min_snr_gamma", 5.0))
 
         train_cfg = config.get("train", {})
         self.multi_res_band_boundaries = [int(x) for x in train_cfg.get("multi_res_band_boundaries", [])]
@@ -364,6 +366,12 @@ class CSDI_base(nn.Module):
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
+    def get_min_snr_weight(self, t):
+        alpha_t = self.alpha_torch[t].squeeze(-1).squeeze(-1)
+        snr = alpha_t / (1.0 - alpha_t + 1.0e-8)
+        clipped_snr = torch.clamp(snr, max=self.min_snr_gamma)
+        return clipped_snr / (snr + 1.0e-8)
+
     def calc_loss(
         self, observed_data, cond_mask, observed_mask, side_info, is_train, timesteps=None, timestep_emb=None, size_emb=None, context=None, text_mask=None, trend_prior=None, set_t=-1
     ):  
@@ -408,8 +416,12 @@ class CSDI_base(nn.Module):
             residual = (noise - predicted) * target_mask 
         else:
             residual = (observed_data - predicted) * target_mask 
+        sq_error = residual ** 2
+        if self.use_min_snr:
+            step_weight = self.get_min_snr_weight(t).view(B, 1, 1)
+            sq_error = sq_error * step_weight
         num_eval = target_mask.sum()
-        loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
+        loss = sq_error.sum() / (num_eval if num_eval > 0 else 1)
         if (not self.noise_esti) and self.multi_res_loss_weight > 0 and len(self.band_slices) > 0:
             aux_loss = self.compute_multi_res_loss(
                 predicted=predicted,
