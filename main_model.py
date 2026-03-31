@@ -108,6 +108,8 @@ class CSDI_base(nn.Module):
         self.trend_volatility_scale = config["diffusion"].get("trend_volatility_scale", 1.0)
         self.trend_time_floor = config["diffusion"].get("trend_time_floor", 0.30)
         self.trend_cfg_random = config["diffusion"].get("trend_cfg_random", False)
+        self.cfg_rescale = float(config["diffusion"].get("cfg_rescale", 0.0))
+        self.cfg_delta_clamp_ratio = float(config["diffusion"].get("cfg_delta_clamp_ratio", 0.0))
 
         train_cfg = config.get("train", {})
         self.multi_res_band_boundaries = [int(x) for x in train_cfg.get("multi_res_band_boundaries", [])]
@@ -292,6 +294,27 @@ class CSDI_base(nn.Module):
         strength_scale = 1.0 + self.trend_strength_scale * (trend_prior[:, 1] - 1.0)
         volatility_scale = 1.0 / (1.0 + self.trend_volatility_scale * trend_prior[:, 2])
         return guide * time_scale * strength_scale * volatility_scale
+
+    def apply_cfg_stabilization(self, predicted_cond, predicted_uncond, effective_guide):
+        guided_delta = effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
+
+        if self.cfg_delta_clamp_ratio > 0:
+            delta_norm = guided_delta.reshape(guided_delta.shape[0], -1).norm(dim=1, keepdim=True).clamp_min(1.0e-6)
+            cond_norm = predicted_cond.reshape(predicted_cond.shape[0], -1).norm(dim=1, keepdim=True).clamp_min(1.0e-6)
+            max_norm = self.cfg_delta_clamp_ratio * cond_norm
+            clamp_scale = torch.clamp(max_norm / delta_norm, max=1.0)
+            guided_delta = guided_delta * clamp_scale.view(-1, 1, 1)
+
+        guided = predicted_uncond + guided_delta
+
+        if self.cfg_rescale > 0:
+            cond_std = predicted_cond.reshape(predicted_cond.shape[0], -1).std(dim=1, unbiased=False, keepdim=True).clamp_min(1.0e-6)
+            guided_std = guided.reshape(guided.shape[0], -1).std(dim=1, unbiased=False, keepdim=True).clamp_min(1.0e-6)
+            guided_rescaled = guided * (cond_std / guided_std).view(-1, 1, 1)
+            mix = min(max(self.cfg_rescale, 0.0), 1.0)
+            guided = mix * guided_rescaled + (1.0 - mix) * guided
+
+        return guided
 
     def build_router_features(self, history, text_mask=None, trend_prior=None):
         slope = history[:, :, -1] - history[:, :, 0]
@@ -515,7 +538,7 @@ class CSDI_base(nn.Module):
                 if self.cfg:
                     predicted_cond, predicted_uncond = predicted[:B], predicted[B:]
                     effective_guide = self.get_effective_guide_weight(guide_w, trend_prior, t, B)
-                    predicted = predicted_uncond + effective_guide[:, None, None] * (predicted_cond - predicted_uncond)
+                    predicted = self.apply_cfg_stabilization(predicted_cond, predicted_uncond, effective_guide)
 
                 if self.noise_esti:
                     # noise prediction
