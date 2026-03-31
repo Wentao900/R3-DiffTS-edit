@@ -102,6 +102,8 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.refine_init_mode = config["model"].get("refine_init_mode", "none")
+        self.refine_init_noise_scale = float(config["model"].get("refine_init_noise_scale", 1.0))
         self.trend_cfg = config["diffusion"].get("trend_cfg", False)
         self.trend_cfg_power = config["diffusion"].get("trend_cfg_power", 1.0)
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 0.35)
@@ -443,6 +445,25 @@ class CSDI_base(nn.Module):
 
         return total_input
 
+    def build_refinement_base(self, observed_data, cond_mask):
+        if self.refine_init_mode == "none":
+            return None
+
+        history = observed_data[:, :, :self.lookback_len]
+        if self.refine_init_mode == "persistence":
+            future_base = history[:, :, -1:].repeat(1, 1, self.pred_len)
+        elif self.refine_init_mode == "linear":
+            last_value = history[:, :, -1:]
+            slope = (history[:, :, -1:] - history[:, :, :1]) / max(self.lookback_len - 1, 1)
+            future_steps = torch.arange(1, self.pred_len + 1, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+            future_base = last_value + slope * future_steps
+        else:
+            return None
+
+        full_base = observed_data.clone()
+        full_base[:, :, self.lookback_len:] = future_base
+        return cond_mask * observed_data + (1.0 - cond_mask) * full_base
+
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None):
         B, K, L = observed_data.shape
         if self.ddim:
@@ -483,7 +504,12 @@ class CSDI_base(nn.Module):
                     noisy_obs = (self.alpha_hat[t] ** 0.5) * noisy_obs + self.beta[t] ** 0.5 * noise
                     noisy_cond_history.append(noisy_obs * cond_mask)
 
-            current_sample = torch.randn_like(observed_data)
+            base_sample = self.build_refinement_base(observed_data, cond_mask)
+            if base_sample is None:
+                current_sample = torch.randn_like(observed_data)
+            else:
+                init_noise = torch.randn_like(observed_data) * self.refine_init_noise_scale
+                current_sample = base_sample + (1.0 - cond_mask) * init_noise
             for t in range(self.sample_steps - 1, -1, -1):
                 if self.is_unconditional == True:
                     diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
