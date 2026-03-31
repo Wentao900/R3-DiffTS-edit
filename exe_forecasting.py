@@ -18,6 +18,7 @@ parser.add_argument('--device', default='cuda:0', help='Device for Attack')
 parser.add_argument("--seed", type=int, default=2025)
 parser.add_argument("--unconditional", action="store_true")
 parser.add_argument("--modelfolder", type=str, default="")
+parser.add_argument("--model_path", type=str, default="", help="path to a saved model directory or model.pth file")
 parser.add_argument("--nsample", type=int, default=15)
 parser.add_argument("--data", type=str, default="custom")
 parser.add_argument("--embed", type=str, default="timeF")
@@ -77,6 +78,32 @@ if args.cot_only:
     args.use_rag_cot = True
 if args.rag_only:
     args.use_rag_cot = True
+
+
+def resolve_model_path(model_path_arg, modelfolder_arg):
+    candidates = []
+
+    if model_path_arg:
+        candidates.append(model_path_arg)
+    if modelfolder_arg:
+        candidates.append(modelfolder_arg)
+        candidates.append(os.path.join("./save", modelfolder_arg))
+
+    for candidate in candidates:
+        normalized = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.isdir(normalized):
+            model_file = os.path.join(normalized, "model.pth")
+            if os.path.isfile(model_file):
+                return model_file
+        elif os.path.isfile(normalized):
+            return normalized
+
+    checked = [os.path.abspath(os.path.expanduser(path)) for path in candidates]
+    raise FileNotFoundError(
+        "Could not find model checkpoint. Checked: " + ", ".join(checked) +
+        ". Pass --model_path with a model directory or a model.pth file, "
+        "or pass --modelfolder with a directory name under ./save."
+    )
 
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
@@ -218,7 +245,9 @@ if args.modelfolder == "":
         valid_epoch_interval=args.valid_interval
     )
 else:
-    model.load_state_dict(torch.load("./save/" + args.modelfolder + "/model.pth"))
+    resolved_model_path = resolve_model_path(args.model_path, args.modelfolder)
+    print("loading model from:", resolved_model_path)
+    model.load_state_dict(torch.load(resolved_model_path, map_location=args.device))
 model.target_dim = target_dim
 if config["diffusion"]["cfg"]:
     if args.guide_w >= 0:
