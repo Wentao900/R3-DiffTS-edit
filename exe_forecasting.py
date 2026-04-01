@@ -47,6 +47,8 @@ parser.add_argument('--trend_strength_scale', type=float, default=0.35, help='tr
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='trend volatility suppression scale')
 parser.add_argument('--trend_time_floor', type=float, default=0.30, help='minimum time schedule floor for trend-aware CFG')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace parsed trend prior with random trend vectors')
+parser.add_argument('--sample_steps', type=int, default=-1, help='override DDIM/implicit sampling steps when positive')
+parser.add_argument('--sample_method', type=str, default='', choices=['', 'linear', 'quad'], help='override sampling schedule when set')
 parser.add_argument('--multi_res_band_boundaries', nargs='*', type=int, default=None, help='prediction band boundaries for multi-resolution loss')
 parser.add_argument('--multi_res_loss_weight', type=float, default=-1, help='weight for multi-resolution auxiliary loss')
 parser.add_argument('--use_scale_router', action='store_true', help='enable scale router for band weighting')
@@ -134,6 +136,10 @@ config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale
 config["diffusion"]["trend_volatility_scale"] = args.trend_volatility_scale
 config["diffusion"]["trend_time_floor"] = args.trend_time_floor
 config["diffusion"]["trend_cfg_random"] = args.trend_cfg_random
+if args.sample_steps > 0:
+    config["diffusion"]["sample_steps"] = args.sample_steps
+if args.sample_method:
+    config["diffusion"]["sample_method"] = args.sample_method
 config["train"].setdefault("multi_res_band_boundaries", [])
 config["train"].setdefault("multi_res_loss_weight", 0.0)
 config["train"].setdefault("multi_res_use_huber", True)
