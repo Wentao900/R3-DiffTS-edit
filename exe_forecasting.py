@@ -47,6 +47,8 @@ parser.add_argument('--trend_strength_scale', type=float, default=0.35, help='tr
 parser.add_argument('--trend_volatility_scale', type=float, default=1.0, help='trend volatility suppression scale')
 parser.add_argument('--trend_time_floor', type=float, default=0.30, help='minimum time schedule floor for trend-aware CFG')
 parser.add_argument('--trend_cfg_random', action='store_true', help='replace parsed trend prior with random trend vectors')
+parser.add_argument('--use_trend_residual', action='store_true', help='subtract a fitted trend base and model residuals in diffusion')
+parser.add_argument('--trend_residual_mode', type=str, default='linear', choices=['linear'], help='trend base construction mode for residual diffusion')
 parser.add_argument('--multi_res_band_boundaries', nargs='*', type=int, default=None, help='prediction band boundaries for multi-resolution loss')
 parser.add_argument('--multi_res_loss_weight', type=float, default=-1, help='weight for multi-resolution auxiliary loss')
 parser.add_argument('--use_scale_router', action='store_true', help='enable scale router for band weighting')
@@ -128,6 +130,8 @@ config["model"]["cot_max_new_tokens"] = args.cot_max_new_tokens
 config["model"]["cot_temperature"] = args.cot_temperature
 config["model"]["cot_cache_size"] = args.cot_cache_size
 config["model"]["cot_device"] = args.cot_device
+config["model"]["use_trend_residual"] = args.use_trend_residual
+config["model"]["trend_residual_mode"] = args.trend_residual_mode
 config["diffusion"]["trend_cfg"] = args.trend_cfg
 config["diffusion"]["trend_cfg_power"] = args.trend_cfg_power
 config["diffusion"]["trend_strength_scale"] = args.trend_strength_scale

@@ -102,6 +102,8 @@ class CSDI_base(nn.Module):
         self.domain = config["model"]["domain"]
         self.save_attn = config["model"]["save_attn"]
         self.save_token = config["model"]["save_token"]
+        self.use_trend_residual = bool(config["model"].get("use_trend_residual", False))
+        self.trend_residual_mode = config["model"].get("trend_residual_mode", "linear")
         self.trend_cfg = config["diffusion"].get("trend_cfg", False)
         self.trend_cfg_power = config["diffusion"].get("trend_cfg_power", 1.0)
         self.trend_strength_scale = config["diffusion"].get("trend_strength_scale", 0.35)
@@ -293,6 +295,32 @@ class CSDI_base(nn.Module):
         volatility_scale = 1.0 / (1.0 + self.trend_volatility_scale * trend_prior[:, 2])
         return guide * time_scale * strength_scale * volatility_scale
 
+    def build_trend_residual_base(self, observed_data, cond_mask):
+        if not self.use_trend_residual:
+            return torch.zeros_like(observed_data)
+        if self.trend_residual_mode != "linear":
+            raise NotImplementedError(f"trend residual mode {self.trend_residual_mode} is not implemented")
+
+        history_len = min(self.lookback_len, observed_data.shape[-1])
+        if history_len <= 0:
+            return torch.zeros_like(observed_data)
+
+        history = observed_data[:, :, :history_len]
+        history_mask = cond_mask[:, :, :history_len]
+        time_idx = torch.arange(history_len, device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+        weight_sum = history_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        mean_t = (history_mask * time_idx).sum(dim=-1, keepdim=True) / weight_sum
+        mean_y = (history_mask * history).sum(dim=-1, keepdim=True) / weight_sum
+        centered_t = time_idx - mean_t
+        centered_y = history - mean_y
+        slope = (history_mask * centered_t * centered_y).sum(dim=-1, keepdim=True) / (
+            (history_mask * centered_t.pow(2)).sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+        )
+        intercept = mean_y - slope * mean_t
+
+        full_time_idx = torch.arange(observed_data.shape[-1], device=observed_data.device, dtype=observed_data.dtype).view(1, 1, -1)
+        return intercept + slope * full_time_idx
+
     def build_router_features(self, history, text_mask=None, trend_prior=None):
         slope = history[:, :, -1] - history[:, :, 0]
         volatility = history.std(dim=-1)
@@ -369,6 +397,8 @@ class CSDI_base(nn.Module):
     ):  
         
         B, K, L = observed_data.shape
+        trend_base = self.build_trend_residual_base(observed_data, cond_mask)
+        observed_data = observed_data - trend_base
         if not self.noise_esti:
             means = torch.sum(observed_data*cond_mask, dim=2, keepdim=True) / torch.sum(cond_mask, dim=2, keepdim=True)
             stdev = torch.sqrt(torch.sum((observed_data - means) ** 2 * cond_mask, dim=2, keepdim=True) / (torch.sum(cond_mask, dim=2, keepdim=True) - 1) + 1e-5)
@@ -445,6 +475,8 @@ class CSDI_base(nn.Module):
 
     def impute(self, observed_data, cond_mask, side_info, n_samples, guide_w, timesteps=None, timestep_emb=None, size_emb=None, context=None, trend_prior=None):
         B, K, L = observed_data.shape
+        trend_base = self.build_trend_residual_base(observed_data, cond_mask)
+        observed_data = observed_data - trend_base
         if self.ddim:
             if self.sample_method == 'linear':
                 a = self.num_steps // self.sample_steps
@@ -564,6 +596,8 @@ class CSDI_base(nn.Module):
                 imputed_samples[:, i] = 0.9 * imputed_samples[:, i] + 0.1 * predicted_from_timestep.detach()
             if not self.noise_esti:
                 imputed_samples[:, i] = imputed_samples[:, i] * stdev + means
+            if self.use_trend_residual:
+                imputed_samples[:, i] = imputed_samples[:, i] + trend_base
         if self.save_attn:
             return imputed_samples, attn 
         else:
